@@ -5,14 +5,18 @@
 @FileName: main.py
 @desc: 主程序入口文件
 """
-import re
+import traceback
+import re,requests
+from concurrent.futures import ThreadPoolExecutor,as_completed
 import os
 import random
 import shutil
+from google.colab import files
 from collections import Counter
 import unicodedata
 from threading import Thread
 from pathlib import Path
+from urllib import request
 import cv2
 from Levenshtein import ratio
 from PIL import Image
@@ -33,6 +37,8 @@ import threading
 import platform
 import multiprocessing
 import time
+import json
+import wget
 
 
 class SubtitleDetect:
@@ -78,6 +84,11 @@ class SubtitleExtractor:
         # 视频尺寸
         self.frame_height = int(self.video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.frame_width = int(self.video_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        
+        self.s_ymin = self.frame_height*self.sub_area[0]
+        self.s_ymax = self.frame_height*self.sub_area[1]
+        self.s_xmin = self.frame_width*self.sub_area[2]
+        self.s_xmax = self.frame_width*self.sub_area[3]
         # 用户未指定字幕区域时，默认字幕出现的区域
         self.default_subtitle_area = config.DEFAULT_SUBTITLE_AREA
         # 提取的视频帧储存目录
@@ -248,7 +259,7 @@ class SubtitleExtractor:
             dt_boxes, elapse = self.sub_detector.detect_subtitle(frame)
             has_subtitle = False
             if self.sub_area is not None:
-                s_ymin, s_ymax, s_xmin, s_xmax = self.sub_area
+                s_ymin, s_ymax, s_xmin, s_xmax = (self.s_ymin, self.s_ymax, self.s_xmin, self.s_xmax)
                 for box in dt_boxes:
                     xmin, xmax, ymin, ymax = box[0], box[1], box[2], box[3]
                     if (s_xmin <= xmin).any() and (xmax <= s_xmax).any() and (s_ymin <= ymin).any() and (ymax <= s_ymax).any():
@@ -348,13 +359,14 @@ class SubtitleExtractor:
         # 定义videoSubFinder所在路径
         path_vsf = os.path.join(config.BASE_DIR, '', 'subfinder', 'VideoSubFinderWXW.exe')
         # ：图像上半部分所占百分比，取值【0-1】
-        top_end = 1 - self.sub_area[0] / self.frame_height
+        #894 1052 152 1264
+        top_end = 1 - self.sub_area[0]
         # bottom_end：图像下半部分所占百分比，取值【0-1】
-        bottom_end = 1 - self.sub_area[1] / self.frame_height
+        bottom_end = 1 - self.sub_area[1]
         # left_end：图像左半部分所占百分比，取值【0-1】
-        left_end = self.sub_area[2] / self.frame_width
+        left_end = self.sub_area[2]
         # re：图像右半部分所占百分比，取值【0-1】
-        right_end = self.sub_area[3] / self.frame_width
+        right_end = self.sub_area[3]
         cpu_count = max(int(multiprocessing.cpu_count() * 2 / 3), 1)
         if cpu_count < 4:
             cpu_count = max(multiprocessing.cpu_count() - 1, 1)
@@ -553,10 +565,10 @@ class SubtitleExtractor:
         else:
             subtitle_frame_index_list = []
             index = 0
-            s_ymin = self.sub_area[0]
-            s_ymax = self.sub_area[1]
-            s_xmin = self.sub_area[2]
-            s_xmax = self.sub_area[3]
+            s_ymin = self.s_ymin
+            s_ymax = self.s_ymax
+            s_xmin = self.s_xmin
+            s_xmax = self.s_xmax
             cap = cv2.VideoCapture(self.video_path)
             success, frame = cap.read()
             if success:
@@ -853,10 +865,10 @@ class SubtitleExtractor:
         area_text = []
         for content, coordinate in zip(text, coordinates):
             if self.sub_area is not None:
-                s_ymin = self.sub_area[0]
-                s_ymax = self.sub_area[1]
-                s_xmin = self.sub_area[2]
-                s_xmax = self.sub_area[3]
+                s_ymin = self.s_ymin
+                s_ymax = self.s_ymax
+                s_xmin = self.s_xmin
+                s_xmax = self.s_xmax
                 xmin = coordinate[0]
                 xmax = coordinate[1]
                 ymin = coordinate[2]
@@ -965,7 +977,7 @@ class SubtitleExtractor:
 
         process, task_queue, progress_queue = subtitle_ocr.async_start(self.video_path,
                                                                        self.raw_subtitle_path,
-                                                                       self.sub_area,
+                                                                       (self.s_ymin, self.s_ymax, self.s_xmin, self.s_xmax),
                                                                        options={'REC_CHAR_TYPE': config.REC_CHAR_TYPE,
                                                                                 'DROP_SCORE': config.DROP_SCORE,
                                                                                 'SUB_AREA_DEVIATION_RATE': config.SUB_AREA_DEVIATION_RATE,
@@ -977,20 +989,53 @@ class SubtitleExtractor:
         # 开启线程负责更新OCR进度
         Thread(target=get_ocr_progress, daemon=True).start()
         return process
-
-
+def get_videos(json_path):
+    video_list=[]
+    with open(json_path,'a+',encoding='utf8')as fp:
+        fp.seek(0)
+        try:
+            video_list = json.load(fp)
+        except:
+            traceback.print_exc()
+            print("获取video json文件失败")
+    return video_list
+def get_real_url(url):
+    headers={
+        "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/86.0.4240.75 Safari/537.36"
+    }
+    i=3
+    while True:
+        try:
+            res = requests.head(url,headers=headers,timeout=5)
+            return res.headers['Location']
+        except:
+            print("真实地址获取失败："+url)
+            i-=1
+            if i==0:
+                return None
+def download_video(video):
+    video_path = "/content/"+video['name']+".mp4"
+    real_url = get_real_url(video['sd_url'])
+    if real_url!=None:
+        i=3
+        while True:
+            try:
+                wget.download(real_url,video_path)
+                return video_path
+            except:
+                print("下载失败："+real_url)
+                i-=1
+                if i==0:
+                    return None
+def dwonload_srt(srt_path):
+    files.download(srt_path)
 if __name__ == '__main__':
     multiprocessing.set_start_method("spawn")
-    # 提示用户输入视频路径
-    video_path = input(f"{config.interface_config['Main']['InputVideo']}").strip()
-    # 提示用户输入字幕区域
-    try:
-        y_min, y_max, x_min, x_max = map(int, input(
-            f"{config.interface_config['Main']['ChooseSubArea']} (ymin ymax xmin xmax)：").split())
-        subtitle_area = (y_min, y_max, x_min, x_max)
-    except ValueError as e:
-        subtitle_area = None
-    # 新建字幕提取对象
-    se = SubtitleExtractor(video_path, subtitle_area)
-    # 开始提取字幕
-    se.run()
+    videos = get_videos("/content/videos.json")
+    subtitle_area = (0.1, 0.9, 0.1, 0.9)
+    for video in videos:
+        video_path = download_video(video)
+        # 新建字幕提取对象
+        se = SubtitleExtractor(video_path, subtitle_area)
+        # 开始提取字幕
+        se.run()
